@@ -19,6 +19,8 @@
 # shellcheck disable=SC2059
 
 RUFUS_UEFI_NTFS_VERSION="${RUFUS_UEFI_NTFS_VERSION:-b30e3b387a3ca7a5e2fddebcc2c8f9538a89b868}"
+# Expected SHA-256 of the uefi-ntfs.img for the version above; update when RUFUS_UEFI_NTFS_VERSION changes
+RUFUS_UEFI_NTFS_SHA256="${RUFUS_UEFI_NTFS_SHA256:-e159fba61b14b20cc0c1631dcf158fb3811f084a9874d190616cb4740a0ccf9c}"
 DD_BLOCK_SIZE="${DD_BLOCK_SIZE:-$((4 * 1024 * 1024))}" # 4MiB
 
 # Entry point of the main code
@@ -181,7 +183,8 @@ init(){
             install_uefi_ntfs_support_partition \
                 "${rufus_uefi_ntfs_version}" \
                 "${target_device}2" \
-                "${temp_dir}"
+                "${temp_dir}" \
+                "${RUFUS_UEFI_NTFS_SHA256}"
         fi
     fi
 
@@ -893,6 +896,7 @@ check_runtime_dependencies(){
         parted \
         partprobe \
         rm \
+        sha256sum \
         stat \
         stty \
         wget \
@@ -1061,7 +1065,7 @@ determine_target_parameters(){
         unset target_filesystem_type_libblkid
     else # install_mode = device
         target_device_ref="${target_media}"
-        target_partition_ref="${target_device}1"
+        target_partition_ref="${target_media}1"
     fi
 
     if [ "${flag_verbose}" = true ]; then
@@ -1074,7 +1078,7 @@ determine_target_parameters(){
         if [ "${install_mode}" = partition ]; then
             print_info \
                 "$(gettext "Target filesystem is '%s'.\\n")" \
-                "${ENUM_SUPPORTED_FILESYSTEMS[$target_filesystem_type]}"
+                "${ENUM_SUPPORTED_FILESYSTEMS[$target_filesystem_type_ref]}"
         fi
     fi
     return 0
@@ -1084,12 +1088,10 @@ is_target_busy(){
     check_function_parameters_quantity 1 "${#}"
     local device="${1}"; shift
 
-    if [ "$(mount \
-            | grep \
-            --count \
-            --fixed-strings\
-            "${device}"
-        )" -ne 0 ]; then
+    if mount \
+        | awk \
+            -v device="${device}" \
+            '$1 == device { found=1 } END { exit !found }'; then
         return 0
     else
         return 1
@@ -1103,24 +1105,20 @@ check_source_and_target_not_busy(){
     local target_device="${1}"; shift
     local target_partition="${1}"; shift
 
-    if [ "$(mount \
-            | grep \
-            --count \
-            --fixed-strings \
-            "${source_media}"
-        )" != 0 ]; then
+    if mount \
+        | awk \
+            -v device="${source_media}" \
+            '$1 == device { found=1 } END { exit !found }'; then
         print_error \
             "$(gettext 'Source media is currently mounted, unmount the partition then try again\n')"
         exit 1
     fi
 
     if [ "${install_mode}" = partition ]; then
-        if [ "$(mount \
-                | grep \
-                --count \
-                --fixed-strings \
-                "${target_partition}"
-            )" != 0 ]; then
+        if mount \
+            | awk \
+                -v device="${target_partition}" \
+                '$1 == device { found=1 } END { exit !found }'; then
             print_error \
                 "$(gettext 'Target partition is currently mounted, unmount the partition then try again\n')"
             exit 1
@@ -1353,11 +1351,12 @@ create_uefi_ntfs_support_partition(){
 # uefi_ntfs_partition: The previously allocated partition for installing UEFI:NTFS, requires at least 512KiB
 # download_directory: The temporary directory for downloading UEFI:NTFS image from GitHub
 install_uefi_ntfs_support_partition(){
-    check_function_parameters_quantity 3 "${#}"
+    check_function_parameters_quantity 4 "${#}"
 
     local -r rufus_uefi_ntfs_version="${1}"; shift
     local -r uefi_ntfs_partition="${1}"; shift
     local -r download_directory="${1}"; shift
+    local -r expected_sha256="${1}"; shift
 
     if ! wget \
         --directory-prefix="${download_directory}" \
@@ -1365,6 +1364,22 @@ install_uefi_ntfs_support_partition(){
         print_warning \
             "Unable to download UEFI:NTFS partition image from GitHub, installation skipped.  Target device might not be bootable if the UEFI firmware doesn't support NTFS filesystem.\\n"
         return 0
+    fi
+
+    local downloaded_sha256
+    downloaded_sha256="$(
+        sha256sum \
+            "${download_directory}/uefi-ntfs.img" \
+        | cut \
+            --fields=1 \
+            --delimiter=' '
+    )"
+    if [ "${downloaded_sha256}" != "${expected_sha256}" ]; then
+        print_error \
+            "$(gettext 'SHA-256 mismatch for uefi-ntfs.img: expected %s, got %s.  Installation aborted for security.\n')" \
+            "${expected_sha256}" \
+            "${downloaded_sha256}"
+        return 1
     fi
 
     # Write partition image to partition
@@ -1755,6 +1770,12 @@ copy_oversized_wim_file(){
         copied_size_current="${caller_copied_size}" \
         percentage_current=0
     wimlib_imagex_pid="${!}"
+    if [ -z "${wimlib_imagex_pid}" ]; then
+        print_warning \
+            "$(gettext 'Failed to start wimlib-imagex, oversized WIM file "%s" not transferred.\n')" \
+            "${source_file}"
+        return 0
+    fi
     while kill -0 "${wimlib_imagex_pid}" 2>/dev/null; do
         splitted_files_size_total=0
         splitted_file_size=0
@@ -1762,8 +1783,17 @@ copy_oversized_wim_file(){
         is_dest_file_available=false
 
         # Ensure swm file is created by wimlib before accounting sizes
+        local -i swm_wait_counter=0
         while test "${is_dest_file_available}" == false && \
                 ! test -e "${dest_file_basename}".swm; do
+            if test "${swm_wait_counter}" -ge 30; then
+                print_warning \
+                    "$(gettext 'Timed out waiting for wimlib-imagex to create split file, giving up.\n')"
+                kill -s SIGKILL "${wimlib_imagex_pid}" 2>/dev/null || true
+                wimlib_imagex_pid=
+                return 1
+            fi
+            ((swm_wait_counter = swm_wait_counter + 1))
             sleep 1
         done
         is_dest_file_available=true
