@@ -181,8 +181,7 @@ init(){
             install_uefi_ntfs_support_partition \
                 "${rufus_uefi_ntfs_version}" \
                 "${target_device}2" \
-                "${temp_dir}" \
-                "${target_device}"
+                "${temp_dir}"
         fi
     fi
 
@@ -643,7 +642,6 @@ process_commandline_parameters(){
         enable_device=false \
         enable_partition=false \
         enable_label=false \
-        enable_workaround_bios_boot_flag=false \
         enable_debugging_internal_function_call=false \
         enable_target_filesystem=false
 
@@ -721,7 +719,6 @@ process_commandline_parameters(){
                 target_fs_label_ref="${parameters[0]}"
                 ;;
             --workaround-bios-boot-flag)
-                enable_workaround_bios_boot_flag=true
                 workaround_bios_boot_flag_ref=true
                 ;;
             --debugging-internal-function-call)
@@ -810,7 +807,7 @@ process_commandline_parameters(){
                 target_filesystem_type_ref=FS_NTFS
             ;;
             *)
-                 \
+                print_error \
                     "$(gettext 'Target filesystem not supported.\n')"
                 return 1
             ;;
@@ -895,7 +892,6 @@ check_runtime_dependencies(){
         mount \
         parted \
         partprobe \
-        readlink \
         rm \
         stat \
         stty \
@@ -1027,8 +1023,16 @@ determine_target_parameters(){
         local target_filesystem_type_libblkid
 
         target_partition_ref="${target_media}"
-        # BASHDOC: Basic Shell Features » Shell Expansions » Shell Parameter Expansion(`${PARAMETER/PATTERN/STRING}')
-        target_device_ref="${target_media/%[0-9]/}"
+        # Determine the parent device using lsblk's PKNAME, which correctly handles
+        # NVMe (nvme0n1p1), MMC (mmcblk0p1), MD (md127p1), and multi-digit partitions
+        target_device_ref="$(
+            lsblk \
+                --nodeps \
+                --noheadings \
+                --output PKNAME \
+                "${target_partition_ref}"
+        )"
+        target_device_ref="/dev/${target_device_ref}"
 
         # Detect target filesystem
         target_filesystem_type_libblkid="$(
@@ -1259,7 +1263,7 @@ create_target_partition(){
         "$(gettext 'Creating target partition...\n')"
 
     # Create target partition
-    # We start at 4MiB for grub (it needs a post-mbr gap for its code) and alignment of flash memery block erase segment in general, for details see http://www.gnu.org/software/grub/manual/grub.html#BIOS-installation and http://lwn.net/Articles/428584/
+    # We start at 4MiB for grub (it needs a post-mbr gap for its code) and alignment of flash memory block erase segment in general, for details see http://www.gnu.org/software/grub/manual/grub.html#BIOS-installation and http://lwn.net/Articles/428584/
     # If NTFS filesystem is used we leave a 512KiB partition at the end for installing UEFI:NTFS partition for NTFS support
     case "${parted_mkpart_fs_type}" in
         fat32)
@@ -1319,7 +1323,7 @@ create_target_partition(){
 # https://github.com/pbatard/uefi-ntfs
 # This routine assumes that there's only one partition on the disk, and the trailing 1024KiB space is not partitioned
 # This routine should be run after create_target_partition and only on target partition's filesystem is NTFS
-# target_device: The target device's entire deice file
+# target_device: The target device's entire device file
 create_uefi_ntfs_support_partition(){
     check_function_parameters_quantity 1 "${#}"
 
@@ -1338,6 +1342,9 @@ create_uefi_ntfs_support_partition(){
         -2048s \
         -1s
 
+    workaround_make_system_realize_partition_table_changed \
+        "${target_device}"
+
     return "$?"
 }
 
@@ -1345,14 +1352,12 @@ create_uefi_ntfs_support_partition(){
 # FIXME: Currently this requires internet access to download the image from GitHub directly, it should be replaced by including the image in our datadir
 # uefi_ntfs_partition: The previously allocated partition for installing UEFI:NTFS, requires at least 512KiB
 # download_directory: The temporary directory for downloading UEFI:NTFS image from GitHub
-# target_device: For workaround_make_system_realize_partition_table_changed
 install_uefi_ntfs_support_partition(){
-    check_function_parameters_quantity 4 "${#}"
+    check_function_parameters_quantity 3 "${#}"
 
     local -r rufus_uefi_ntfs_version="${1}"; shift
     local -r uefi_ntfs_partition="${1}"; shift
     local -r download_directory="${1}"; shift
-    local -r target_device="${1}"; shift
 
     if ! wget \
         --directory-prefix="${download_directory}" \
@@ -1421,7 +1426,7 @@ check_target_partition(){
 
 # Check if the UEFI:NTFS support partition exists
 # Currently it depends on the fact that this partition has a label of "UEFI_NTFS"
-# target_device: The UEFI:NTFS partition residing entier device file
+# target_device: The UEFI:NTFS partition residing entire device file
 check_uefi_ntfs_support_partition(){
     check_function_parameters_quantity 1 "${#}"
 
@@ -1520,6 +1525,7 @@ check_target_filesystem_free_space(){
     local -r target_fs_mountpoint="${1}"; shift
     local -r source_fs_mountpoint="${1}"; shift
 
+    local free_space
     free_space=$(
         df \
             --block-size=1 \
@@ -1529,6 +1535,7 @@ check_target_filesystem_free_space(){
             "${target_fs_mountpoint}" \
         | awk '{print $4}'
     )
+    local free_space_human_readable
     free_space_human_readable=$(
         df \
             --human-readable \
@@ -1538,6 +1545,7 @@ check_target_filesystem_free_space(){
             "${target_fs_mountpoint}" \
         | awk '{print $4}'
     )
+    local needed_space
     needed_space=$(
         du \
             --summarize \
@@ -1545,6 +1553,7 @@ check_target_filesystem_free_space(){
             "${source_fs_mountpoint}" \
         | awk '{print $1}'
     )
+    local needed_space_human_readable
     needed_space_human_readable=$(
         du \
             --summarize \
@@ -1552,7 +1561,7 @@ check_target_filesystem_free_space(){
             "${source_fs_mountpoint}" \
         | awk '{print $1}'
     )
-    additional_space_required_for_grub_installation="$((1000 * 1000 * 10))" # 10MiB
+    local -r additional_space_required_for_grub_installation="$((1000 * 1000 * 10))" # 10MiB
     ((needed_space = needed_space + additional_space_required_for_grub_installation))
 
     if [ "${needed_space}" -gt "${free_space}" ]; then
@@ -1648,7 +1657,11 @@ copy_filesystem_files(){
         # BASHDOC: Basic Shell Features » Shell Expansions » Arithmetic Expansion
         # BASHDOC: Bash Features » Shell Arithmetic
         ((copied_size = copied_size + source_file_size)) || true
-        ((percentage = (copied_size * 100) / total_size)) || true
+        if test "${total_size}" -ne 0; then
+            ((percentage = (copied_size * 100) / total_size)) || true
+        else
+            percentage=0
+        fi
         echo -en "${percentage}%\\r"
     done < <( \
         find \
@@ -1705,7 +1718,11 @@ copy_large_file(){
         # BASHDOC: Basic Shell Features » Shell Expansions » Arithmetic Expansion
         # BASHDOC: Bash Features » Shell Arithmetic
         ((copied_size_total = caller_copied_size + dd_block_size * i)) || true
-        ((percentage = (copied_size_total * 100) / caller_total_size)) || true
+        if test "${caller_total_size}" -ne 0; then
+            ((percentage = (copied_size_total * 100) / caller_total_size)) || true
+        else
+            percentage=0
+        fi
         echo -en "${percentage}%\\r"
     done; unset i copied_size_total percentage
 
@@ -1760,7 +1777,11 @@ copy_oversized_wim_file(){
             (( splitted_files_size_total += splitted_file_size ))
         done
         (( copied_size_current += splitted_files_size_total ))
-        (( percentage = (copied_size_current * 100) / caller_total_size))
+        if test "${caller_total_size}" -ne 0; then
+            (( percentage = (copied_size_current * 100) / caller_total_size)) || true
+        else
+            percentage=0
+        fi
         echo -en "${percentage}%\\r"
 
         # Use less resource during accounting sizes
@@ -2045,7 +2066,7 @@ trap_exit(){
 trap_interrupt(){
     printf '\n' # Separate message with previous output
     print_warning \
-        "$(gettext 'Recieved SIGINT, program is interrupted.\n')"
+        "$(gettext 'Received SIGINT, program is interrupted.\n')"
     return 1
 }
 
